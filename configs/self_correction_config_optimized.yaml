@@ -1,0 +1,92 @@
+# configs/self_correction_config_optimized.yaml
+# 优化的自修正配置 - 解决过度保守问题
+
+# LLM API 设置
+llm_settings:
+  # API密钥 (请填写您的实际API密钥)
+  api_key: "sk-79e8deb9cf0542b4bcab2f2dbc58b68d"  # 替换为您的密钥
+  
+  # API端点 (请填写您的实际端点)
+  api_endpoint: "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"
+  
+  # 模型名称
+  model_name: "qwen-turbo"  # 或 qwen-plus, qwen-max
+  
+  # 生成参数 - 优化版本
+  temperature: 0.05         # 降低随机性，提高一致性
+  max_tokens: 400          # 适中长度，避免过长响应
+  timeout_seconds: 90      # 适中的超时时间
+  max_retries: 3           # 重试次数
+  
+  # 停止序列 - 简化版本
+  stop_sequences:
+    - ";"
+    - "\n\n"
+    - "Note:"
+
+# Prompt设置 - 更保守和具体的模板
+prompt_settings:
+  templates:
+    generic: |
+      You are an expert SQL developer. Review this SQL query and fix ONLY obvious errors.
+      Be very conservative - do NOT change table/column names unless you are absolutely certain they are wrong.
+      
+      Schema:
+      {schema_context}
+      
+      Question: {nlq}
+      SQL to review: {initial_sql}
+      
+      Instructions:
+      1. Only fix syntax errors
+      2. Only fix clearly wrong table/column names that don't exist in the schema
+      3. Do NOT make unnecessary changes
+      4. If the SQL looks correct, return it as-is
+      
+      Fixed SQL:
+      
+    guided: |
+      You are an expert SQL developer. Fix this specific SQL issue, but be very conservative.
+      
+      Schema:
+      {schema_context}
+      
+      Question: {nlq}
+      SQL to fix: {initial_sql}
+      Issue to fix: {hint}
+      
+      Instructions:
+      1. Fix ONLY the specific issue mentioned
+      2. Make minimal changes
+      3. Do NOT change other parts of the SQL
+      4. Verify your changes against the schema
+      
+      Fixed SQL:
+
+  # Few-shot示例 - 展示保守修正
+  few_shot_examples:
+    - question: "How many singers are there?"
+      schema_text: |
+        TABLE singer (
+          singer_id INT PRIMARY KEY,
+          name VARCHAR,
+          age INT
+        );
+      initial_sql: "SELECT count(*) FROM singers"
+      hint: "Table name error - should be 'singer' not 'singers'"
+      correct_sql: "SELECT count(*) FROM singer"
+      
+    - question: "What are the names of all cities?"
+      schema_text: |
+        TABLE city (
+          city_id INT PRIMARY KEY,
+          city_name VARCHAR,
+          population INT
+        );
+      initial_sql: "SELECT Name FROM city"
+      hint: "Column name case error - use lowercase"
+      correct_sql: "SELECT city_name FROM city"
+
+# 日志设置
+logging_settings:
+  log_dir: "./correction_logs_optimized"

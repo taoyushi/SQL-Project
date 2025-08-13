@@ -1,0 +1,503 @@
+# self_correction/self_correction_module.py
+import re
+import os
+import logging
+import json
+import time
+from typing import Dict, Any, Tuple, Optional
+from .prompt_generator import PromptGenerator, PromptStrategy
+from .llm_api import QwenAPIClient, LLMError
+from .sql_validator import SQLValidator, ExecutionResult
+from .config import SelfCorrectionConfig
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+class SelfCorrectionModule:
+    """
+    核心自修正模块，集成 Prompt Generation, LLM Interaction, SQL Validation,
+    和 Fallback Logic to correct initial SQL queries.
+    """
+
+    def __init__(self, config: SelfCorrectionConfig):
+        """
+        初始化自修正模块。
+
+        Args:
+            config (SelfCorrectionConfig): 配置对象，包含 LLM API 设置、Prompt 策略等。
+        """
+        self.config = config
+        
+        # 验证配置
+        if not config.validate_config():
+            raise ValueError("Invalid configuration provided")
+            
+        self.prompt_generator = PromptGenerator(config.prompt_templates, config.few_shot_examples)
+        self.llm_client = QwenAPIClient(
+            api_key=config.llm_api_key,
+            endpoint=config.llm_api_endpoint,
+            model=config.llm_model_name,
+            timeout=config.llm_timeout_seconds,
+            max_retries=config.llm_max_retries
+        )
+        self.sql_validator = SQLValidator(timeout_seconds=30)
+        self.log_dir = config.log_dir
+
+        # Ensure log directory exists
+        os.makedirs(self.log_dir, exist_ok=True)
+        logger.info(f"SelfCorrectionModule initialized with log directory: {self.log_dir}")
+        
+        # Test API connection
+        if not self._test_api_connection():
+            logger.warning("API connection test failed. Corrections may fail.")
+
+    def _test_api_connection(self) -> bool:
+        """测试API连接"""
+        try:
+            return self.llm_client.test_connection()
+        except Exception as e:
+            logger.error(f"API connection test error: {e}")
+            return False
+
+    def process(self, nlq: str, schema: Dict[str, Any], initial_sql: str, db_path: str) -> Tuple[str, str]:
+        """
+        处理一个 NLQ, Schema, Initial SQL 对，尝试使用 LLM 进行自修正。
+
+        Args:
+            nlq (str): 原始自然语言问题。
+            schema (Dict[str, Any]): 结构化的数据库 Schema 信息。
+            initial_sql (str): RESDSQL 生成的初步 SQL。
+            db_path (str): 对应的数据库文件的绝对路径。
+
+        Returns:
+            Tuple[str, str]: 最终输出的 SQL，以及修正状态字符串。
+        """
+        db_id = os.path.basename(os.path.dirname(db_path)) if os.path.dirname(db_path) else "unknown"
+
+        correction_log = {
+            "question": nlq,
+            "db_id": db_id,
+            "initial_sql": initial_sql,
+            "corrected_sql_llm": None,
+            "final_sql_output": initial_sql,
+            "initial_sql_executable": False,
+            "corrected_sql_executable": False,
+            "validation_error": None,
+            "correction_status": "correction_failed",
+            "prompt_used": None,
+            "llm_api_log_id": None,
+            "processing_time_ms": 0
+        }
+        start_time = time.time()
+
+        try:
+            # 1. 验证初始SQL
+            initial_validation_result = self._validate_sql(initial_sql, db_path)
+            correction_log["initial_sql_executable"] = initial_validation_result.is_executable
+            
+            if not initial_validation_result.is_executable:
+                hint = self._generate_guided_hint(initial_sql, initial_validation_result.error_message)
+                prompt_strategy = PromptStrategy.GUIDED
+            else:
+                # 即使初始SQL可执行，也尝试修正以提高质量
+                hint = self._generate_guided_hint(initial_sql, None)
+                prompt_strategy = PromptStrategy.GUIDED
+
+            # 2. 格式化Schema并生成Prompt
+            schema_text = self._format_schema_for_prompt(schema)
+            prompt = self.prompt_generator.generate_prompt(
+                nlq=nlq,
+                schema_context=schema_text,
+                initial_sql=initial_sql,
+                strategy=prompt_strategy,
+                hint=hint
+            )
+            correction_log["prompt_used"] = prompt
+            logger.debug(f"Generated prompt for DB {db_id}: {prompt[:500]}...")
+
+            # 3. 调用 LLM API
+            try:
+                logger.info(f"Calling LLM for DB {db_id}...")
+                llm_response_raw = self.llm_client.get_correction(
+                    prompt=prompt,
+                    temperature=self.config.llm_temperature,
+                    max_tokens=self.config.llm_max_tokens,
+                    stop_sequences=self.config.llm_stop_sequences
+                )
+                logger.debug(f"LLM response for DB {db_id}: {llm_response_raw[:500]}...")
+            except LLMError as e:
+                logger.error(f"LLM API call failed for DB {db_id}: {e}")
+                correction_log["validation_error"] = f"LLM API Error: {e}"
+                correction_log["correction_status"] = "api_error"
+                self._save_log(correction_log)
+                correction_log["processing_time_ms"] = (time.time() - start_time) * 1000
+                return initial_sql, correction_log["correction_status"]
+
+            # 4. 解析 LLM 响应
+            corrected_sql = self._parse_llm_response(llm_response_raw)
+            correction_log["corrected_sql_llm"] = corrected_sql
+            logger.debug(f"Parsed corrected SQL for DB {db_id}: {corrected_sql}")
+
+            corrected_validation_result = ExecutionResult(False, "No corrected SQL to validate")
+            if corrected_sql:
+                # 5. 验证修正后的 SQL
+                corrected_validation_result = self._validate_sql(corrected_sql, db_path)
+                correction_log["corrected_sql_executable"] = corrected_validation_result.is_executable
+                if not corrected_validation_result.is_executable:
+                    correction_log["validation_error"] = corrected_validation_result.error_message
+                    logger.warning(f"Corrected SQL is not executable for DB {db_id}: {corrected_validation_result.error_message}")
+            else:
+                logger.warning(f"LLM returned empty or unparseable SQL for DB {db_id}")
+                correction_log["validation_error"] = "LLM returned empty or unparseable SQL"
+
+            # 6. 应用回退策略
+            final_sql, correction_status = self._apply_fallback_strategy(
+                initial_sql,
+                initial_validation_result,
+                corrected_sql if corrected_sql else initial_sql,
+                corrected_validation_result
+            )
+            correction_log["final_sql_output"] = final_sql
+            correction_log["correction_status"] = correction_status
+            logger.info(f"Final SQL decision for DB {db_id}: {correction_status}")
+
+        except Exception as e:
+            logger.error(f"Unexpected error during correction for DB {db_id}: {e}", exc_info=True)
+            correction_log["validation_error"] = f"Unexpected internal error: {e}"
+            correction_log["correction_status"] = "internal_error"
+            final_sql = initial_sql
+            correction_status = "internal_error"
+
+        finally:
+            correction_log["processing_time_ms"] = (time.time() - start_time) * 1000
+            self._save_log(correction_log)
+            return correction_log["final_sql_output"], correction_log["correction_status"]
+
+    def _generate_guided_hint(self, initial_sql: str, validation_error: Optional[str]) -> str:
+        """根据执行验证错误信息生成指导性 Hint"""
+        if validation_error:
+            error_lower = validation_error.lower()
+            
+            if "syntax error" in error_lower:
+                return "Hint: The initial SQL failed due to a syntax error. Please review and fix the syntax."
+            elif "no such table" in error_lower or "no such column" in error_lower:
+                return "Hint: The initial SQL references a non-existent table or column. Check the schema and correct the names."
+            elif "ambiguous column name" in error_lower:
+                return "Hint: The initial SQL has ambiguous column references. Use table aliases or fully qualified column names."
+            elif "misuse of aggregate" in error_lower or "group by" in error_lower:
+                return "Hint: The initial SQL has aggregation errors. Verify GROUP BY clauses and aggregate function usage."
+            elif "foreign key constraint" in error_lower:
+                return "Hint: The initial SQL violates foreign key constraints. Check JOIN conditions and table relationships."
+            elif "timeout" in error_lower or "locked" in error_lower:
+                return "Hint: The initial SQL execution timed out or the database was locked. Simplify the query if possible."
+            else:
+                return f"Hint: The initial SQL failed with error: '{validation_error}'. Review the query logic and schema."
+        else:
+            return "Hint: Please carefully review the SQL and ensure it correctly answers the question based on the schema."
+
+    def _format_schema_for_prompt(self, schema: Dict[str, Any]) -> str:
+        """将结构化的 Schema 信息转换为 LLM Prompt 易于理解的文本格式"""
+        if not schema:
+            return "Schema: No schema information available."
+            
+        schema_text = ""
+        tables = schema.get('table_names_original', [])
+        columns = schema.get('column_names_original', [])
+        column_types = schema.get('column_types', [])
+        primary_keys = schema.get('primary_keys', [])
+        foreign_keys = schema.get('foreign_keys', [])
+
+        if not tables or not columns:
+            return "Schema: Schema information is incomplete."
+
+        # Create column details mapping
+        col_details = {}
+        for i in range(1, len(columns)):  # Skip index 0 which is usually '*'
+            if i < len(column_types):
+                col_details[i] = {
+                    "name": columns[i][1],
+                    "table_id": columns[i][0],
+                    "type": column_types[i]
+                }
+
+        # Group columns by table
+        tables_with_columns = {}
+        for col_id, details in col_details.items():
+            table_id = details["table_id"]
+            if 0 <= table_id < len(tables):
+                table_name = tables[table_id]
+                if table_name not in tables_with_columns:
+                    tables_with_columns[table_name] = []
+                is_pk = col_id in primary_keys
+                col_str = f"{details['name']} {details['type'].upper()}"
+                if is_pk:
+                    col_str += " PRIMARY KEY"
+                tables_with_columns[table_name].append(col_str)
+
+        # Format table definitions
+        for table_name, cols in tables_with_columns.items():
+            schema_text += f"TABLE {table_name} (\n"
+            for i, col_str in enumerate(cols):
+                schema_text += f"  {col_str}"
+                if i < len(cols) - 1:
+                    schema_text += ","
+                schema_text += "\n"
+            schema_text += ");\n\n"
+
+        # Format foreign key relationships
+        if foreign_keys:
+            schema_text += "Foreign Keys:\n"
+            for fk in foreign_keys:
+                if len(fk) >= 2:
+                    col1_id, col2_id = fk[0], fk[1]
+                    if col1_id in col_details and col2_id in col_details:
+                        col1_name = col_details[col1_id]["name"]
+                        table1_name = tables[col_details[col1_id]["table_id"]]
+                        col2_name = col_details[col2_id]["name"]
+                        table2_name = tables[col_details[col2_id]["table_id"]]
+                        schema_text += f"- {table1_name}.{col1_name} references {table2_name}.{col2_name}\n"
+
+        return schema_text.strip()
+
+    def _parse_llm_response(self, response_text: str) -> Optional[str]:
+        """
+        改进的LLM响应解析器，更好地处理包含解释文本的回复
+        """
+        if not response_text:
+            return None
+        
+        # 1. 首先尝试查找标准标记
+        markers = [
+            "Corrected SQL only:",
+            "Corrected SQL:",
+            "Fixed SQL:",
+            "Correct SQL:",
+            "SQL:",
+            "Query:",
+            "Return only the corrected SQL:",
+        ]
+        
+        for marker in markers:
+            if marker in response_text:
+                sql_part = response_text.split(marker, 1)[1].strip()
+                if sql_part:
+                    return self._clean_extracted_sql(sql_part)
+        
+        # 2. 按行分割，查找包含SQL关键字的行
+        lines = response_text.strip().split('\n')
+        sql_keywords = r'\b(SELECT|INSERT|UPDATE|DELETE|WITH)\b'
+        
+        for line in lines:
+            line = line.strip()
+            if re.search(sql_keywords, line, re.IGNORECASE):
+                # 检查这一行是否是解释文本的一部分
+                if not self._is_explanation_line(line):
+                    # 从这一行开始，收集连续的SQL行
+                    sql_lines = self._collect_sql_lines(lines, lines.index(line.strip()))
+                    if sql_lines:
+                        return self._clean_extracted_sql(' '.join(sql_lines))
+        
+        # 3. 使用正则表达式提取SQL语句
+        sql_pattern = r'(SELECT[^;]*?)(?:;|\n\n|$)'
+        matches = re.findall(sql_pattern, response_text, re.IGNORECASE | re.DOTALL)
+        if matches:
+            # 选择最长的匹配
+            longest_match = max(matches, key=len)
+            return self._clean_extracted_sql(longest_match)
+        
+        # 4. 最后尝试：假设整个响应就是SQL（去除明显的解释文本）
+        cleaned_response = self._remove_explanation_text(response_text)
+        if cleaned_response and len(cleaned_response.split()) > 2:  # 至少包含几个词
+            return self._clean_extracted_sql(cleaned_response)
+        
+        return None
+
+    def _is_explanation_line(self, line: str) -> bool:
+        """判断一行文本是否是解释性文本而不是SQL"""
+        line_lower = line.lower().strip()
+        
+        # 明显的解释性开头
+        explanation_starters = [
+            "the query", "this sql", "the initial", "explanation", "note:",
+            "however", "since", "assuming", "the schema", "based on", "analysis",
+            "issues", "changes", "here's", "i cannot", "i can offer", "guidance:",
+            "1.", "2.", "3.", "first", "second", "third", "corrected version:",
+        ]
+        
+        for starter in explanation_starters:
+            if line_lower.startswith(starter):
+                return True
+        
+        # 包含解释性短语
+        explanation_phrases = [
+            "does not require", "seems to correctly", "provides guidance",
+            "cannot provide", "offer guidance", "the corrected query"
+        ]
+        
+        for phrase in explanation_phrases:
+            if phrase in line_lower:
+                return True
+        
+        return False
+
+    def _collect_sql_lines(self, lines: list, start_idx: int) -> list:
+        """从起始行开始收集连续的SQL行"""
+        sql_lines = []
+        
+        for i in range(start_idx, len(lines)):
+            line = lines[i].strip()
+            if not line:
+                continue
+                
+            # 如果遇到明显的解释行，停止收集
+            if self._is_explanation_line(line):
+                break
+                
+            # 如果行看起来像SQL的一部分，添加它
+            if (re.search(r'\b(SELECT|FROM|WHERE|JOIN|GROUP|ORDER|HAVING|UNION)\b', line, re.IGNORECASE) or
+                re.search(r'[(),]', line) or  # 包含SQL常见符号
+                (sql_lines and len(line.split()) <= 10)):  # 短行且已经开始收集SQL
+                sql_lines.append(line)
+            elif sql_lines:  # 已经开始收集但当前行不像SQL
+                break
+        
+        return sql_lines
+
+    def _remove_explanation_text(self, text: str) -> str:
+        """移除文本中的解释性内容"""
+        lines = text.split('\n')
+        clean_lines = []
+        
+        for line in lines:
+            line = line.strip()
+            if line and not self._is_explanation_line(line):
+                clean_lines.append(line)
+        
+        return ' '.join(clean_lines)
+
+    def _clean_extracted_sql(self, sql_text: str) -> str:
+        """清理提取出的SQL文本"""
+        if not sql_text:
+            return ""
+        
+        # 移除markdown代码块标记
+        sql_text = re.sub(r'```sql\s*', '', sql_text, flags=re.IGNORECASE)
+        sql_text = re.sub(r'```\s*', '', sql_text)
+        
+        # 移除常见的解释性前缀
+        prefixes_to_remove = [
+            r'^.*?Corrected SQL[:\s]*',
+            r'^.*?Fixed SQL[:\s]*', 
+            r'^.*?SQL[:\s]*',
+            r'^.*?Query[:\s]*',
+        ]
+        
+        for prefix in prefixes_to_remove:
+            sql_text = re.sub(prefix, '', sql_text, flags=re.IGNORECASE)
+        
+        # 按行处理，移除解释行
+        lines = sql_text.split('\n')
+        clean_lines = []
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # 跳过解释行
+            if self._is_explanation_line(line):
+                continue
+            
+            # 移除行内注释
+            if '--' in line:
+                line = line.split('--')[0].strip()
+            
+            if line:
+                clean_lines.append(line)
+        
+        # 合并所有行
+        result = ' '.join(clean_lines)
+        
+        # 标准化空格
+        result = re.sub(r'\s+', ' ', result)
+        
+        # 移除尾随分号
+        result = result.rstrip(';').strip()
+        
+        # 基本验证：确保看起来像SQL
+        if not re.search(r'\b(SELECT|INSERT|UPDATE|DELETE)\b', result, re.IGNORECASE):
+            return ""
+        
+        return result
+
+    def _validate_sql(self, sql: str, db_path: str) -> ExecutionResult:
+        """验证 SQL 查询是否能在指定的数据库上执行成功"""
+        if not sql or not db_path:
+            return ExecutionResult(False, "SQL or DB path is empty")
+        try:
+            logger.debug(f"Validating SQL: {sql[:100]}... on DB: {db_path}")
+            result = self.sql_validator.execute_sql(sql, db_path)
+            logger.debug(f"Validation result: {result}")
+            return result
+        except Exception as e:
+            logger.error(f"Error during SQL validation: {e}")
+            return ExecutionResult(False, f"Validator internal error: {e}")
+
+    def _apply_fallback_strategy(
+        self,
+        initial_sql: str,
+        initial_validation_result: ExecutionResult,
+        corrected_sql: str,
+        corrected_validation_result: ExecutionResult
+    ) -> Tuple[str, str]:
+        """根据验证结果应用回退策略"""
+        
+        # Case 1: Corrected SQL is executable
+        if corrected_sql and corrected_validation_result.is_executable:
+            # If both are executable, prefer corrected (assuming it's better)
+            # Could add more sophisticated comparison here
+            logger.info("Corrected SQL is executable. Using corrected SQL.")
+            return corrected_sql, "corrected"
+            
+        # Case 2: Corrected SQL is not executable, but initial SQL is
+        elif initial_validation_result.is_executable:
+            logger.info("Corrected SQL failed validation. Falling back to initial SQL.")
+            return initial_sql, "fallback_to_initial"
+            
+        # Case 3: Neither is executable
+        else:
+            logger.warning("Neither initial nor corrected SQL is executable.")
+            # Return initial SQL with failure status
+            return initial_sql, "correction_failed"
+
+    def _save_log(self, log_data: Dict[str, Any]):
+        """将自修正过程的日志保存到文件"""
+        timestamp = int(time.time())
+        log_file_path = os.path.join(
+            self.log_dir, 
+            f"correction_log_{log_data['db_id']}_{timestamp}.json"
+        )
+        try:
+            with open(log_file_path, 'w', encoding='utf-8') as f:
+                json.dump(log_data, f, ensure_ascii=False, indent=2)
+            logger.debug(f"Correction log saved to {log_file_path}")
+        except Exception as e:
+            logger.error(f"Failed to save correction log: {e}")
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """获取修正模块的统计信息"""
+        log_files = []
+        if os.path.exists(self.log_dir):
+            log_files = [f for f in os.listdir(self.log_dir) if f.endswith('.json')]
+        
+        stats = {
+            "total_corrections_attempted": len(log_files),
+            "log_directory": self.log_dir,
+            "config_summary": {
+                "model": self.config.llm_model_name,
+                "temperature": self.config.llm_temperature,
+                "max_tokens": self.config.llm_max_tokens
+            }
+        }
+        
+        return stats

@@ -1,0 +1,86 @@
+# configs/self_correction_config_qwen25.yaml
+# 针对qwen2.5系列模型的配置文件
+
+# --- LLM API设置 ---
+llm_settings:
+  # API密钥
+  api_key: "sk-79e8deb9cf0542b4bcab2f2dbc58b68d"
+  
+  # API端点 - 请根据实际服务商修改
+  # 阿里云DashScope示例: https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation
+  # OpenAI兼容API示例: https://api.openai.com/v1/chat/completions
+  # 自部署API示例: http://your-server.com:port/v1/chat/completions
+  api_endpoint: "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"
+  
+  # 模型名称 - 请根据可用模型修改
+  # 可选: qwen2.5-72b-instruct, qwen2.5-32b-instruct, qwen2.5-14b-instruct, qwen2.5-7b-instruct
+  model_name: "qwen-turbo"
+  
+  # 生成参数
+  temperature: 0.1          # 较低的温度值以获得更确定性的输出
+  max_tokens: 600          # 适中的token数量
+  timeout_seconds: 90      # API超时时间
+  max_retries: 3           # 重试次数
+  
+  # 停止序列
+  stop_sequences:
+    - "#;\n\n"
+    - "\n\n---"
+    - "---\n"
+
+# --- Prompt设置 ---
+prompt_settings:
+  # Prompt模板 - 针对qwen2.5模型优化
+  templates:
+    generic: |
+      You are an expert SQL developer. Your task is to review and correct SQL queries generated from natural language questions.
+
+      Given a natural language question, database schema, and an initial SQL query, provide a corrected version that accurately answers the question.
+
+      Rules:
+      1. If the initial SQL is correct, return it unchanged
+      2. If incorrect, identify and fix errors
+      3. Use exact table/column names from schema
+      4. Ensure proper SQL syntax
+
+      Schema:
+      {schema_context}
+
+      Question: {nlq}
+      Initial SQL: {initial_sql}
+      Hint: {hint}
+
+      Corrected SQL:
+
+    guided: |
+      You are an expert SQL developer. Your task is to review and correct SQL queries generated from natural language questions.
+
+      Pay special attention to the hint provided, which identifies specific validation issues.
+
+      Schema:
+      {schema_context}
+
+      Question: {nlq}
+      Initial SQL: {initial_sql}
+      
+      Validation Hint: {hint}
+
+      Please provide the corrected SQL based on the hint and schema:
+
+  # Few-shot示例
+  few_shot_examples:
+    - question: "List cities with population over 1 million."
+      schema_text: |
+        TABLE city (
+          city_id INT PRIMARY KEY,
+          city_name VARCHAR,
+          population INT
+        );
+      initial_sql: "SELECT Name FROM city WHERE Population > 1000000"
+      hint: "Column 'Name' does not exist. Use 'city_name'."
+      correct_sql: "SELECT city_name FROM city WHERE population > 1000000"
+
+# --- 日志设置 ---
+logging_settings:
+  # 日志保存目录
+  log_dir: "./correction_logs_qwen25"

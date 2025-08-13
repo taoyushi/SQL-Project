@@ -1,0 +1,205 @@
+# self_correction/self_correction_module.py
+import re
+import os
+import logging
+import json
+import time
+from typing import Dict, Any, Tuple, Optional
+from .prompt_generator import PromptGenerator, PromptStrategy
+from .llm_api import QwenAPIClient, LLMError
+from .sql_validator import SQLValidator, ExecutionResult
+from .config import SelfCorrectionConfig
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+class SelfCorrectionModule:
+    """
+    核心自修正模块，集成 Prompt Generation, LLM Interaction, SQL Validation,
+    和 Fallback Logic to correct initial SQL queries.
+    """
+
+    def __init__(self, config: SelfCorrectionConfig):
+        """
+        初始化自修正模块。
+
+        Args:
+            config (SelfCorrectionConfig): 配置对象，包含 LLM API 设置、Prompt 策略等。
+        """
+        self.config = config
+        
+        # 验证配置
+        if not config.validate_config():
+            raise ValueError("Invalid configuration provided")
+            
+        self.prompt_generator = PromptGenerator(config.prompt_templates, config.few_shot_examples)
+        self.llm_client = QwenAPIClient(
+            api_key=config.llm_api_key,
+            endpoint=config.llm_api_endpoint,
+            model=config.llm_model_name,
+            timeout=config.llm_timeout_seconds,
+            max_retries=config.llm_max_retries
+        )
+        self.sql_validator = SQLValidator(timeout_seconds=30)
+        self.log_dir = config.log_dir
+
+        # Ensure log directory exists
+        os.makedirs(self.log_dir, exist_ok=True)
+        logger.info(f"SelfCorrectionModule initialized with log directory: {self.log_dir}")
+        
+        # Test API connection
+        if not self._test_api_connection():
+            logger.warning("API connection test failed. Corrections may fail.")
+
+    def _test_api_connection(self) -> bool:
+        """测试API连接"""
+        try:
+            return self.llm_client.test_connection()
+        except Exception as e:
+            logger.error(f"API connection test error: {e}")
+            return False
+
+    def process(self, nlq: str, schema: Dict[str, Any], initial_sql: str, db_path: str) -> Tuple[str, str]:
+        """
+        智能处理：只修正真正有错误的SQL
+        """
+        db_id = os.path.basename(os.path.dirname(db_path)) if os.path.dirname(db_path) else "unknown"
+
+        correction_log = {
+            "question": nlq,
+            "db_id": db_id,
+            "initial_sql": initial_sql,
+            "corrected_sql_llm": None,
+            "final_sql_output": initial_sql,
+            "initial_sql_executable": False,
+            "corrected_sql_executable": False,
+            "validation_error": None,
+            "correction_status": "correction_failed",
+            "prompt_used": None,
+            "llm_api_log_id": None,
+            "processing_time_ms": 0
+        }
+        start_time = time.time()
+
+        try:
+            # 1. 首先验证初始SQL
+            initial_validation_result = self._validate_sql(initial_sql, db_path)
+            correction_log["initial_sql_executable"] = initial_validation_result.is_executable
+            
+            # 🎯 关键策略：只修正不可执行的SQL
+            if initial_validation_result.is_executable:
+                logger.info(f"Initial SQL is executable for DB {db_id}. Skipping correction.")
+                correction_log["correction_status"] = "no_correction_needed"
+                correction_log["final_sql_output"] = initial_sql
+                self._save_log(correction_log)
+                correction_log["processing_time_ms"] = (time.time() - start_time) * 1000
+                return initial_sql, "no_correction_needed"
+            
+            # 2. 只有当初始SQL不可执行时才进行修正
+            hint = self._generate_guided_hint(initial_sql, initial_validation_result.error_message)
+            prompt_strategy = PromptStrategy.GUIDED
+
+            # 3. 生成非常保守的Prompt
+            schema_text = self._format_schema_for_prompt(schema)
+            prompt = self.prompt_generator.generate_prompt(
+                nlq=nlq,
+                schema_context=schema_text,
+                initial_sql=initial_sql,
+                strategy=prompt_strategy,
+                hint=hint
+            )
+            correction_log["prompt_used"] = prompt
+            logger.debug(f"Generated prompt for DB {db_id}: {prompt[:500]}...")
+
+            # 4. 调用 LLM API
+            try:
+                logger.info(f"Calling LLM for DB {db_id} (initial SQL was not executable)...")
+                llm_response_raw = self.llm_client.get_correction(
+                    prompt=prompt,
+                    temperature=self.config.llm_temperature,
+                    max_tokens=self.config.llm_max_tokens,
+                    stop_sequences=self.config.llm_stop_sequences
+                )
+                logger.debug(f"LLM response for DB {db_id}: {llm_response_raw[:500]}...")
+            except LLMError as e:
+                logger.error(f"LLM API call failed for DB {db_id}: {e}")
+                correction_log["validation_error"] = f"LLM API Error: {e}"
+                correction_log["correction_status"] = "api_error"
+                self._save_log(correction_log)
+                correction_log["processing_time_ms"] = (time.time() - start_time) * 1000
+                return initial_sql, correction_log["correction_status"]
+
+            # 5. 解析 LLM 响应
+            corrected_sql = self._parse_llm_response(llm_response_raw)
+            correction_log["corrected_sql_llm"] = corrected_sql
+            logger.debug(f"Parsed corrected SQL for DB {db_id}: {corrected_sql}")
+
+            corrected_validation_result = ExecutionResult(False, "No corrected SQL to validate")
+            if corrected_sql:
+                # 6. 验证修正后的 SQL
+                corrected_validation_result = self._validate_sql(corrected_sql, db_path)
+                correction_log["corrected_sql_executable"] = corrected_validation_result.is_executable
+                if not corrected_validation_result.is_executable:
+                    correction_log["validation_error"] = corrected_validation_result.error_message
+                    logger.warning(f"Corrected SQL is not executable for DB {db_id}: {corrected_validation_result.error_message}")
+            else:
+                logger.warning(f"LLM returned empty or unparseable SQL for DB {db_id}")
+                correction_log["validation_error"] = "LLM returned empty or unparseable SQL"
+
+            # 7. 应用保守的回退策略
+            final_sql, correction_status = self._apply_conservative_fallback_strategy(
+                initial_sql,
+                initial_validation_result,
+                corrected_sql if corrected_sql else initial_sql,
+                corrected_validation_result
+            )
+            correction_log["final_sql_output"] = final_sql
+            correction_log["correction_status"] = correction_status
+            logger.info(f"Final SQL decision for DB {db_id}: {correction_status}")
+
+        except Exception as e:
+            logger.error(f"Unexpected error during correction for DB {db_id}: {e}", exc_info=True)
+            correction_log["validation_error"] = f"Unexpected internal error: {e}"
+            correction_log["correction_status"] = "internal_error"
+            final_sql = initial_sql
+            correction_status = "internal_error"
+
+        finally:
+            correction_log["processing_time_ms"] = (time.time() - start_time) * 1000
+            self._save_log(correction_log)
+            return correction_log["final_sql_output"], correction_log["correction_status"]
+
+    def _apply_conservative_fallback_strategy(
+        self,
+        initial_sql: str,
+        initial_validation_result: ExecutionResult,
+        corrected_sql: str,
+        corrected_validation_result: ExecutionResult
+    ) -> Tuple[str, str]:
+        """保守的回退策略：只有当修正SQL明确更好时才使用"""
+        
+        # 只有当修正SQL可执行且初始SQL不可执行时，才使用修正SQL
+        if (corrected_sql and 
+            corrected_validation_result.is_executable and 
+            not initial_validation_result.is_executable):
+            logger.info("Using corrected SQL (initial was not executable, corrected is executable).")
+            return corrected_sql, "corrected"
+        else:
+            logger.info("Using initial SQL (conservative fallback).")
+            return initial_sql, "fallback_to_initial"    def get_statistics(self) -> Dict[str, Any]:
+        """获取修正模块的统计信息"""
+        log_files = []
+        if os.path.exists(self.log_dir):
+            log_files = [f for f in os.listdir(self.log_dir) if f.endswith('.json')]
+        
+        stats = {
+            "total_corrections_attempted": len(log_files),
+            "log_directory": self.log_dir,
+            "config_summary": {
+                "model": self.config.llm_model_name,
+                "temperature": self.config.llm_temperature,
+                "max_tokens": self.config.llm_max_tokens
+            }
+        }
+        
+        return stats

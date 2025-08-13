@@ -1,0 +1,66 @@
+# configs/self_correction_config_fixed.yaml
+# 修复LLM输出格式问题的配置
+
+llm_settings:
+  api_key: "sk-79e8deb9cf0542b4bcab2f2dbc58b68d"
+  api_endpoint: "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"  # 需要填写实际端点
+  model_name: "qwen-turbo"   # 需要填写实际模型
+  temperature: 0.01          # 极低温度确保确定性
+  max_tokens: 150           # 限制输出长度，避免过多解释
+  timeout_seconds: 60
+  max_retries: 2
+  stop_sequences:
+    - "\n\n"
+    - ";"
+    - "Explanation"
+    - "Note:"
+    - "However"
+
+prompt_settings:
+  templates:
+    generic: |
+      You must return ONLY the corrected SQL query. Do not include explanations, comments, or additional text.
+
+      Schema:
+      {schema_context}
+
+      Question: {nlq}
+      Current SQL: {initial_sql}
+      Issue: {hint}
+
+      Return only the corrected SQL:
+
+    guided: |
+      IMPORTANT: Return ONLY the SQL query. No explanations or comments.
+
+      Schema:
+      {schema_context}
+
+      Question: {nlq}
+      SQL with error: {initial_sql}
+      Error to fix: {hint}
+
+      Corrected SQL only:
+
+  # 添加强制SQL输出的few-shot示例
+  few_shot_examples:
+    - question: "Find all students older than 18"
+      schema_text: |
+        TABLE student (
+          id INT PRIMARY KEY,
+          name VARCHAR,
+          age INT
+        );
+      initial_sql: "SELECT * FROM students WHERE age > 18"
+      hint: "Table name 'students' is incorrect, should be 'student'"
+      correct_sql: "SELECT * FROM student WHERE age > 18"
+
+    - question: "Count employees in Sales department"
+      schema_text: |
+        TABLE employee (emp_id INT, name VARCHAR, dept VARCHAR);
+      initial_sql: "SELECT count(*) FROM employee WHERE department = 'Sales'"
+      hint: "Column 'department' does not exist, use 'dept'"
+      correct_sql: "SELECT count(*) FROM employee WHERE dept = 'Sales'"
+
+logging_settings:
+  log_dir: "./correction_logs_fixed"
